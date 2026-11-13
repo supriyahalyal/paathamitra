@@ -1,20 +1,30 @@
 """
-Paathamitra (ಪಾಠಮಿತ್ರ) - Stage 5: Free Kannada Voice Input & Output (Groq Whisper + Edge-TTS)
-=============================================================================================
-In this final stage, we complete the end-to-end ₹0 Multilingual Parent Study Helper:
-1. Speech-to-Text (STT): Groq Whisper API (whisper-large-v3-turbo with language="kn")
-   converts spoken Kannada/Kanglish into accurate text via st.audio_input.
-2. Text-to-Speech (TTS): Microsoft neural voice (kn-IN-SapnaNeural) via edge-tts
-   (100% free, no API key required) to read explanations aloud for parents.
-3. Audio Controls: Sidebar toggle ("Read answer aloud") and on-demand audio playback button.
-4. Full RAG integration: Upload -> OCR -> Vector DB -> Retrieval -> Reasoning -> Spoken Audio.
+Paathamitra (ಪಾಠಮಿತ್ರ) - Multi-Chapter Management & Active Lesson Tracker
+========================================================================
+Features:
+1. Multi-format Ingestion: Digital PDFs & Scanned/Photo OCR (PyMuPDF + Groq Vision).
+2. Rate-Limit Resilience: Automatic model rotation on 429 rate limit + optional backup key in sidebar.
+3. Multilingual Vector Memory: Local MiniLM embeddings + ChromaDB.
+4. Active Chapter Metadata: Saves chapter details (filename, pages, chunks) to disk in active_chapter.json.
+   Shows clearly which chapter is loaded in memory across browser refreshes.
+5. Clean Chapter Switching: Automatically replaces previous chapter when a new one is built,
+   preventing subject mix-ups (e.g. Science mixing with History).
+6. Grounded RAG: Simple spoken Kannada explanations with English terms in brackets (Groq Llama 3 / Qwen).
+7. Voice Microphone & Narration: Groq Whisper STT + Microsoft Neural Kannada TTS (Edge-TTS).
+8. YouTube Video Recommendation Agent:
+   - Finds top educational animation matching the lesson concept (at ₹0 API cost).
+   - Automatically appends '&cc_load_policy=1&cc_lang_pref=kn&hl=kn' to launch with Kannada CC.
 """
 
 import os
 import sys
+import json
 import shutil
 import base64
 import asyncio
+import urllib.request
+import urllib.parse
+import re
 import streamlit as st
 import fitz  # PyMuPDF: fast and lightweight PDF parsing library
 from groq import Groq  # Groq SDK for ultra-fast LPU inference (Vision, LLM, Whisper)
@@ -45,6 +55,41 @@ st.set_page_config(
 )
 
 DB_DIRECTORY = "./textbook_db"
+CHAPTER_METADATA_FILE = os.path.join(DB_DIRECTORY, "active_chapter.json")
+
+
+def get_effective_groq_api_key() -> str:
+    """Returns custom sidebar key if entered, otherwise falls back to .env key."""
+    custom_key = st.session_state.get("custom_groq_key", "").strip()
+    if custom_key:
+        return custom_key
+    return os.getenv("GROQ_API_KEY", "")
+
+
+# ---------------------------------------------------------
+# Chapter Metadata Helpers (Persistent across refreshes)
+# ---------------------------------------------------------
+def save_active_chapter_metadata(file_name: str, total_pages: int, total_chunks: int):
+    """Saves active chapter details to disk so they persist across refreshes."""
+    os.makedirs(DB_DIRECTORY, exist_ok=True)
+    metadata = {
+        "file_name": file_name,
+        "total_pages": total_pages,
+        "total_chunks": total_chunks,
+    }
+    with open(CHAPTER_METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def get_active_chapter_metadata() -> dict | None:
+    """Retrieves active chapter details from disk."""
+    if os.path.exists(CHAPTER_METADATA_FILE):
+        try:
+            with open(CHAPTER_METADATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 # ---------------------------------------------------------
@@ -150,20 +195,22 @@ def clear_vector_store():
     st.session_state["extracted_docs"] = None
     st.session_state["chunks_count"] = 0
     st.session_state["current_file_name"] = None
-    st.session_state["last_transcription"] = None
+    st.session_state["last_recorded_audio"] = None
+    st.session_state["voice_query"] = ""
 
 
 # ---------------------------------------------------------
-# Vision OCR Helper (Groq Free Tier with Dynamic Fallback)
+# Vision OCR Helper (Groq Free Tier with Dynamic Fallback & 429 Rotation)
 # ---------------------------------------------------------
 def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str = "image/png") -> str:
     """
     Sends an image to Groq Vision to extract English textbook text,
     mathematical equations, and brief diagram descriptions.
+    Automatically rotates between models on 404 or 429 (Rate Limit) errors.
     """
-    groq_api_key = os.getenv("GROQ_API_KEY")
+    groq_api_key = get_effective_groq_api_key()
     if not groq_api_key or groq_api_key == "your_groq_api_key_here":
-        raise ValueError("GROQ_API_KEY is not set. Please configure your key in the .env file.")
+        raise ValueError("GROQ_API_KEY is not set. Please configure your key in the .env file or sidebar.")
 
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
     client = Groq(api_key=groq_api_key)
@@ -172,8 +219,8 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str = "image/pn
     try:
         available_ids = [m.id for m in client.models.list().data]
         priority_models = [
-            "qwen/qwen3.8-27b",
             "meta-models/muse-spark-open",
+            "qwen/qwen3.8-27b",
             "llama-3.2-11b-vision-preview",
             "llama-3.2-90b-vision-preview",
             "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -183,12 +230,12 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str = "image/pn
                 candidate_models.append(p)
                 
         for m_id in available_ids:
-            if any(k in m_id.lower() for k in ["vision", "vl", "scout"]) and m_id not in candidate_models:
+            if any(k in m_id.lower() for k in ["vision", "vl", "scout", "muse"]) and m_id not in candidate_models:
                 candidate_models.append(m_id)
     except Exception:
         pass
 
-    for fallback in ["qwen/qwen3.8-27b", "meta-models/muse-spark-open", "llama-3.2-11b-vision-preview"]:
+    for fallback in ["meta-models/muse-spark-open", "qwen/qwen3.8-27b", "llama-3.2-11b-vision-preview"]:
         if fallback not in candidate_models:
             candidate_models.append(fallback)
 
@@ -227,13 +274,16 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str = "image/pn
         except Exception as e:
             last_error = e
             err_msg = str(e).lower()
-            if "model_not_found" in err_msg or "does not exist" in err_msg or "404" in err_msg:
+            # If 404 (not found) or 429 (rate limit / tokens exceeded), rotate to next vision model
+            if any(k in err_msg for k in ["model_not_found", "does not exist", "404", "rate_limit", "429", "tokens per day"]):
                 continue
             else:
                 raise e
 
     raise RuntimeError(
-        f"Unable to process image. Tried vision models {candidate_models}. Error: {last_error}"
+        f"Daily free rate limit reached on vision models ({candidate_models}). "
+        f"You can either wait a few minutes, upload a digital PDF (which uses 0 Vision tokens), "
+        f"or add a second free Groq API key in the sidebar. Last error: {last_error}"
     )
 
 
@@ -242,10 +292,14 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str = "image/pn
 # ---------------------------------------------------------
 def process_uploaded_file(uploaded_file) -> tuple[list[Document], int]:
     """
-    1. Extracts text from PDF or Image using PyMuPDF / Groq Vision OCR.
-    2. Chunks extracted Document pages using RecursiveCharacterTextSplitter.
-    3. Generates local multilingual embeddings and indexes into ./textbook_db using Chroma.
+    1. Replaces any previous chapter by clearing old database vectors.
+    2. Extracts text from PDF or Image using PyMuPDF / Groq Vision OCR.
+    3. Chunks extracted Document pages using RecursiveCharacterTextSplitter.
+    4. Generates local multilingual embeddings and indexes into ./textbook_db using Chroma.
+    5. Saves active chapter metadata to disk.
     """
+    clear_vector_store()
+
     file_bytes = uploaded_file.getvalue()
     file_name = uploaded_file.name
     file_ext = file_name.lower().split(".")[-1]
@@ -312,6 +366,9 @@ def process_uploaded_file(uploaded_file) -> tuple[list[Document], int]:
             persist_directory=DB_DIRECTORY,
         )
 
+    # Step 4: Save chapter metadata for UI persistence
+    save_active_chapter_metadata(file_name, len(raw_documents), len(chunks))
+
     return raw_documents, len(chunks)
 
 
@@ -321,7 +378,6 @@ def process_uploaded_file(uploaded_file) -> tuple[list[Document], int]:
 def get_groq_reasoning_models(groq_api_key: str) -> list[str]:
     """
     Finds available text reasoning models on Groq in order of preference.
-    Ensures that 404 model_not_found errors are avoided.
     """
     priority = [
         "llama-3.3-70b-versatile",
@@ -404,7 +460,7 @@ def ask_textbook(question: str, target_language: str) -> tuple[str, list[Documen
         context_parts.append(f"[Textbook Page {page_num}]:\n{doc.page_content}")
     context_text = "\n\n---\n\n".join(context_parts)
 
-    groq_api_key = os.getenv("GROQ_API_KEY")
+    groq_api_key = get_effective_groq_api_key()
     candidate_models = get_groq_reasoning_models(groq_api_key)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -430,7 +486,7 @@ def ask_textbook(question: str, target_language: str) -> tuple[str, list[Documen
         except Exception as e:
             last_error = e
             err_str = str(e).lower()
-            if "model_not_found" in err_str or "does not exist" in err_str or "404" in err_str:
+            if any(k in err_str for k in ["model_not_found", "does not exist", "404", "rate_limit", "429"]):
                 continue
             else:
                 raise e
@@ -448,14 +504,13 @@ def transcribe_kannada_audio(audio_bytes: bytes, target_language: str = "Kannada
     Transcribes spoken Kannada, Kanglish, or English audio into text
     using Groq Whisper API (whisper-large-v3-turbo, language="kn" or "en").
     """
-    groq_api_key = os.getenv("GROQ_API_KEY")
+    groq_api_key = get_effective_groq_api_key()
     if not groq_api_key or groq_api_key == "your_groq_api_key_here":
-        raise ValueError("GROQ_API_KEY is not set. Please configure your key in the .env file.")
+        raise ValueError("GROQ_API_KEY is not set. Please configure your key in the .env file or sidebar.")
 
     client = Groq(api_key=groq_api_key)
     lang_code = "kn" if "Kannada" in target_language else "en"
 
-    # Send audio bytes directly in tuple format (filename, bytes) to Groq Whisper
     transcription = client.audio.transcriptions.create(
         file=("user_audio.wav", audio_bytes),
         model="whisper-large-v3-turbo",
@@ -485,22 +540,17 @@ def speak_kannada_text(text: str, target_language: str = "Kannada (ಕನ್ನ�
     at ₹0 API cost with zero external registration required.
     Truncates to the first 500 characters for snappy, instantaneous audio delivery.
     """
-    # Select voice based on language setting
     voice = "kn-IN-SapnaNeural" if "Kannada" in target_language else "en-IN-NeerjaNeural"
     
-    # Take first 500 characters to keep audio response snappy
     cleaned = text[:500]
-    # Remove markdown formatting characters for clean spoken pronunciation
     for ch in ["*", "#", "_", "`", ">", "[", "]", "(", ")"]:
         cleaned = cleaned.replace(ch, " ")
     cleaned = " ".join(cleaned.split())
 
     try:
-        # Run async coroutine safely across environments
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # If running inside an existing loop, run via new event loop
                 new_loop = asyncio.new_event_loop()
                 return new_loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice))
             return loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice))
@@ -509,6 +559,68 @@ def speak_kannada_text(text: str, target_language: str = "Kannada (ಕನ್ನ�
     except Exception as e:
         st.warning(f"Could not synthesize audio: {e}")
         return b""
+
+
+# ---------------------------------------------------------
+# YouTube Educational Video Recommendation Agent (₹0 Cost)
+# ---------------------------------------------------------
+def find_youtube_educational_video(topic_query: str) -> dict:
+    """
+    Discovers top animated educational videos on YouTube explaining the textbook concept.
+    Automatically includes '&cc_load_policy=1&cc_lang_pref=kn&hl=kn' so when clicked,
+    YouTube automatically enables Closed Captions (CC) and prioritizes Kannada.
+    """
+    cleaned = topic_query.lower()
+    for stop_word in ["andre enu", "yavuvu", "tilisi", "what is", "explain", "parts of", "bagagalu"]:
+        cleaned = cleaned.replace(stop_word, "")
+    cleaned = cleaned.strip()
+    
+    if not cleaned:
+        cleaned = topic_query
+
+    search_keywords = f"{cleaned} science animation educational school"
+    encoded_query = urllib.parse.quote_plus(search_keywords)
+    search_url = f"https://www.youtube.com/results?search_query={encoded_query}"
+
+    video_id = None
+    try:
+        req = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=4) as response:
+            html = response.read().decode("utf-8")
+            matches = re.findall(r"watch\?v=([a-zA-Z0-9_-]{11})", html)
+            seen = set()
+            unique_ids = [m for m in matches if not (m in seen or seen.add(m))]
+            if unique_ids:
+                video_id = unique_ids[0]
+    except Exception:
+        pass
+
+    if video_id:
+        watch_url = f"https://www.youtube.com/watch?v={video_id}&cc_load_policy=1&cc_lang_pref=kn&hl=kn"
+        embed_url = f"https://www.youtube.com/embed/{video_id}?cc_load_policy=1&cc_lang_pref=kn&hl=kn"
+        return {
+            "video_id": video_id,
+            "watch_url": watch_url,
+            "embed_url": embed_url,
+            "search_url": search_url,
+            "keywords": search_keywords,
+        }
+    else:
+        return {
+            "video_id": None,
+            "watch_url": search_url,
+            "embed_url": None,
+            "search_url": search_url,
+            "keywords": search_keywords,
+        }
 
 
 # ---------------------------------------------------------
@@ -524,7 +636,6 @@ with st.sidebar:
         help="Choose the language in which you want answers explained.",
     )
     
-    # Audio Read Aloud Toggle
     read_aloud = st.checkbox(
         label="🔊 Read answer aloud (ಧ್ವನಿ ಮೂಲಕ ಓದಿ)",
         value=False,
@@ -533,10 +644,12 @@ with st.sidebar:
 
     st.divider()
 
-    # Memory Status Indicator
+    # Memory Status & Active Chapter Indicator in Sidebar
     st.subheader("📚 Memory Management")
-    if is_database_populated():
-        st.success("🟢 Active Textbook Memory: Ready")
+    active_meta = get_active_chapter_metadata()
+    if is_database_populated() and active_meta:
+        st.success(f"🟢 **Active Chapter:**\n`{active_meta['file_name']}`")
+        st.caption(f"📄 {active_meta['total_pages']} Pages | 🧩 {active_meta['total_chunks']} Chunks")
         if st.button("🗑️ Clear Textbook Memory", help="Deletes stored chapter embeddings to load a new lesson/subject"):
             clear_vector_store()
             st.success("🧹 Textbook memory cleared! You can now upload a new lesson.")
@@ -547,28 +660,38 @@ with st.sidebar:
     st.divider()
     
     # API Key & Model status check in sidebar
-    groq_key_set = bool(os.getenv("GROQ_API_KEY") and os.getenv("GROQ_API_KEY") != "your_groq_api_key_here")
+    effective_key = get_effective_groq_api_key()
+    groq_key_set = bool(effective_key and effective_key != "your_groq_api_key_here")
     if groq_key_set:
-        st.success("🔑 Groq API Key: Detected")
+        st.success("🔑 Groq API Key: Active")
         try:
-            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            client = Groq(api_key=effective_key)
             available_models = [m.id for m in client.models.list().data]
             
             vision_candidates = [m for m in available_models if any(k in m.lower() for k in ["qwen", "muse", "vision", "vl", "scout"])]
             if vision_candidates:
                 st.caption(f"👁️ Vision Model: `{vision_candidates[0]}`")
                 
-            reasoning_candidates = get_groq_reasoning_models(os.getenv("GROQ_API_KEY"))
+            reasoning_candidates = get_groq_reasoning_models(effective_key)
             if reasoning_candidates:
                 st.caption(f"🤖 Reasoning Model: `{reasoning_candidates[0]}`")
         except Exception:
             pass
     else:
-        st.warning("⚠️ Groq API Key: Not detected in .env")
+        st.warning("⚠️ Groq API Key: Not detected")
+
+    # Optional Backup Key Input (Lifesaver if daily free quota is hit)
+    custom_key_input = st.text_input(
+        label="Backup Groq Key (Optional):",
+        type="password",
+        help="Paste a backup free Groq key here if your primary key hits the daily free token quota.",
+        key="custom_groq_key",
+    )
 
     st.caption("🧠 Embedding: `paraphrase-multilingual-MiniLM-L12-v2`")
     st.caption("🎤 STT: `whisper-large-v3-turbo` (Groq Free)")
     st.caption("🔊 TTS: `kn-IN-SapnaNeural` (Edge-TTS ₹0)")
+    st.caption("🎥 Video: `YouTube Agent` (Kannada CC, ₹0)")
 
 
 # ---------------------------------------------------------
@@ -577,9 +700,14 @@ with st.sidebar:
 st.title("📚 Paathamitra (ಪಾಠಮಿತ್ರ)")
 st.caption("Empowering parents with textbook explanations in simple spoken Kannada (₹0 API cost)")
 
-# Notification if textbook is already loaded from disk
-if is_database_populated() and not st.session_state.get("extracted_docs"):
-    st.info("💡 **Textbook chapter is already loaded in local memory!** You do not need to re-upload. You can ask questions directly in Section 2 below.")
+# Active Chapter Card (Always visible at the top so parents know what lesson is loaded)
+current_meta = get_active_chapter_metadata()
+if is_database_populated() and current_meta:
+    st.info(
+        f"📖 **Currently Active Lesson:** **`{current_meta['file_name']}`** "
+        f"({current_meta['total_pages']} pages, {current_meta['total_chunks']} chunks in memory)\n\n"
+        f"💡 *All questions asked below will be answered strictly using this chapter.*"
+    )
 
 # ---------------------------------------------------------
 # Section 1: Textbook Chapter / Photo Uploader & Indexer
@@ -608,7 +736,11 @@ if uploaded_file is not None:
             extracted_docs, chunk_count = process_uploaded_file(uploaded_file)
             st.session_state["extracted_docs"] = extracted_docs
             st.session_state["chunks_count"] = chunk_count
-            st.success(f"🎉 Successfully extracted {len(extracted_docs)} page(s) and stored {chunk_count} chunks into `./textbook_db`!")
+            st.success(
+                f"🎉 Successfully replaced textbook memory with **{uploaded_file.name}**! "
+                f"({len(extracted_docs)} pages, {chunk_count} chunks indexed)"
+            )
+            st.rerun()
         except Exception as e:
             st.error(f"❌ Error during processing: {e}")
 
@@ -638,50 +770,55 @@ st.subheader("2. Ask a Question (ಪ್ರಶ್ನೆ ಕೇಳಿ)")
 # Voice Microphone Input via Streamlit 1.40+
 audio_input_data = st.audio_input("🎤 Tap to speak in Kannada or English (ಧ್ವನಿ ಮೂಲಕ ಪ್ರಶ್ನೆ ಕೇಳಿ)")
 
-voice_transcription = ""
 if audio_input_data is not None:
     audio_bytes = audio_input_data.getvalue()
-    # Check if this is a newly recorded audio clip
     if st.session_state.get("last_recorded_audio") != audio_bytes:
         st.session_state["last_recorded_audio"] = audio_bytes
         with st.spinner("🎙️ Transcribing Kannada speech using Groq Whisper..."):
             try:
-                voice_transcription = transcribe_kannada_audio(audio_bytes, target_language)
-                st.session_state["active_transcription"] = voice_transcription
-                st.success(f"🗣️ Heard: **{voice_transcription}**")
+                voice_text = transcribe_kannada_audio(audio_bytes, target_language)
+                st.session_state["voice_query"] = voice_text
             except Exception as e:
                 st.error(f"❌ Voice transcription error: {e}")
 
-# Text input fallback / manual typing
+# Text input for manual typing (cleanly decoupled from voice input)
 user_typed_question = st.text_input(
     label="Or type your question in Kannada, Kanglish, or English:",
-    value=st.session_state.get("active_transcription", ""),
     placeholder="e.g., ಹೂವಿನ ಭಾಗಗಳು ಯಾವುವು? or What are the parts of a flower?",
+    key="manual_typed_query",
 )
 
-active_question = user_typed_question.strip()
+# Priority: Typed question takes precedence if present; otherwise use the latest voice recording
+active_question = ""
+if user_typed_question.strip():
+    active_question = user_typed_question.strip()
+elif st.session_state.get("voice_query"):
+    active_question = st.session_state["voice_query"]
+    st.info(f"🗣️ **Spoken Voice Question:** {active_question}")
 
 if active_question:
+    meta_now = get_active_chapter_metadata()
+    current_doc_label = meta_now["file_name"] if meta_now else "Uploaded Textbook"
+
     st.markdown("### 💬 Your Question (ನಿಮ್ಮ ಪ್ರಶ್ನೆ):")
-    st.write(f"**Question:** {active_question}")
-    st.write(f"**Selected Explanation Language:** {target_language}")
+    st.markdown(f"**Lesson:** 📘 `{current_doc_label}`")
+    st.markdown(f"**Question:** {active_question}")
+    st.markdown(f"**Selected Explanation Language:** {target_language}")
     
     vs = get_vector_store()
     if vs is not None:
-        with st.spinner("🤖 Consulting Paathamitra & reading textbook excerpts..."):
+        with st.spinner(f"🤖 Consulting Paathamitra on {current_doc_label}..."):
             try:
                 answer, source_docs = ask_textbook(active_question, target_language)
                 
                 # Display Answer in a clean presentation card
-                st.markdown("### 💡 Explanation (ವಿವರಣೆ):")
+                st.markdown(f"### 💡 Explanation for *{current_doc_label}* (ವಿವರಣೆ):")
                 st.markdown(answer)
                 
-                # Audio Playback Handling
-                # 1. Automatic if sidebar checkbox is ticked
-                # 2. Or manual button click
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    play_clicked = st.button("🔊 Play Voice (ಕೇಳಿ)")
+                # Polished Audio Playback Button
+                col_btn, col_empty = st.columns([1, 2])
+                with col_btn:
+                    play_clicked = st.button("🔊 Listen (ಕೇಳಿ)", use_container_width=True)
 
                 if read_aloud or play_clicked:
                     with st.spinner("🔊 Generating spoken Kannada audio..."):
@@ -689,8 +826,35 @@ if active_question:
                         if audio_speech:
                             st.audio(audio_speech, format="audio/mp3", autoplay=True)
                 
+                # YouTube Educational Video Recommendation Agent
+                with st.spinner("🎥 Finding related animated video lesson..."):
+                    yt_data = find_youtube_educational_video(active_question)
+
+                if yt_data:
+                    st.markdown("### 🎥 Recommended Video Lesson (ವೀಡಿಯೊ ವಿವರಣೆ):")
+                    if yt_data.get("video_id"):
+                        st.video(f"https://www.youtube.com/watch?v={yt_data['video_id']}")
+                        st.markdown(
+                            f"👉 [**ಕನ್ನಡ ಸಬ್‌ಟೈಟಲ್ಸ್‌ನೊಂದಿಗೆ YouTube ನಲ್ಲಿ ವೀಕ್ಷಿಸಿ (Watch on YouTube with Kannada CC)**]({yt_data['watch_url']})"
+                        )
+                    else:
+                        st.markdown(
+                            f"👉 [**YouTube ನಲ್ಲಿ ಸಂಬಂಧಿತ ವೀಡಿಯೊಗಳನ್ನು ಹುಡುಕಿ (Search related videos on YouTube)**]({yt_data['search_url']})"
+                        )
+
+                    with st.expander("ℹ️ How to see Kannada subtitles (ಕನ್ನಡ ಸಬ್‌ಟೈಟಲ್ಸ್ ನೋಡುವ ವಿಧಾನ):"):
+                        st.markdown(
+                            """
+                            1. ಮೇಲಿನ ಲಿಂಕ್ ಕ್ಲಿಕ್ ಮಾಡಿದಾಗ **CC (Subtitles)** ತಾನಾಗಿಯೇ ಆನ್ ಆಗುತ್ತದೆ ಮತ್ತು ಕನ್ನಡಕ್ಕೆ ಆದ್ಯತೆ ನೀಡಲಾಗುತ್ತದೆ.
+                            2. ಒಂದು ವೇಳೆ ವೀಡಿಯೊದಲ್ಲಿ ಸಬ್‌ಟೈಟಲ್ಸ್ ಇಂಗ್ಲಿಷ್‌ನಲ್ಲಿದ್ದರೆ:
+                               - ವೀಡಿಯೊದ ಕೆಳಭಾಗದಲ್ಲಿರುವ **Settings (⚙️)** ಐಕಾನ್ ಕ್ಲಿಕ್ ಮಾಡಿ.
+                               - **Subtitles/CC** -> **Auto-translate (ಸ್ವಯಂ ಅನುವಾದ)** ಕ್ಲಿಕ್ ಮಾಡಿ.
+                               - ಪಟ್ಟಿಯಿಂದ **Kannada (ಕನ್ನಡ)** ಆಯ್ಕೆಮಾಡಿ.
+                            """
+                        )
+
                 # Display Source Chunks Expander for full parent transparency
-                with st.expander("📖 View Extracted English Textbook Text (ಮೂಲ ಪಠ್ಯಪುಸ್ತಕ ಪುಟಗಳು)", expanded=False):
+                with st.expander(f"📖 View Extracted English Textbook Text from {current_doc_label}", expanded=False):
                     for i, doc in enumerate(source_docs, 1):
                         page_ref = doc.metadata.get("page", "Unknown")
                         st.markdown(f"**Excerpt {i} (from Page {page_ref}):**")
