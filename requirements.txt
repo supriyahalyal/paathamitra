@@ -3,10 +3,10 @@ python-dotenv
 pymupdf
 groq
 edge-tts
+fastembed
 sentence-transformers
 langchain
 langchain-community
 langchain-huggingface
 langchain-chroma
 langchain-groq
-
