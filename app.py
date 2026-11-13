@@ -10,7 +10,9 @@ Features:
 5. Clean Chapter Switching: Automatically replaces previous chapter when a new one is built,
    preventing subject mix-ups (e.g. Science mixing with History).
 6. Grounded RAG: Simple spoken Kannada explanations with English terms in brackets (Groq Llama 3 / Qwen).
-7. Voice Microphone & Narration: Groq Whisper STT + Microsoft Neural Kannada TTS (Edge-TTS).
+7. Voice Microphone & Indian English/Kannada Neural TTS:
+   - Groq Whisper STT.
+   - Microsoft Neural Indian English (Neerja & Prabhat) and Kannada (Sapna & Gagan) via Edge-TTS (₹0).
 8. YouTube Video Recommendation Agent:
    - Finds top educational animation matching the lesson concept (at ₹0 API cost).
    - Automatically appends '&cc_load_policy=1&cc_lang_pref=kn&hl=kn' to launch with Kannada CC.
@@ -56,6 +58,14 @@ st.set_page_config(
 
 DB_DIRECTORY = "./textbook_db"
 CHAPTER_METADATA_FILE = os.path.join(DB_DIRECTORY, "active_chapter.json")
+
+# Map of natural neural voices (authentic Indian English and Kannada voices)
+VOICE_MAP = {
+    "Indian English - Female (Neerja)": "en-IN-NeerjaNeural",
+    "Indian English - Male (Prabhat)": "en-IN-PrabhatNeural",
+    "Kannada - Female (Sapna)": "kn-IN-SapnaNeural",
+    "Kannada - Male (Gagan)": "kn-IN-GaganNeural",
+}
 
 
 def get_effective_groq_api_key() -> str:
@@ -274,7 +284,6 @@ def extract_text_from_image_bytes(image_bytes: bytes, mime_type: str = "image/pn
         except Exception as e:
             last_error = e
             err_msg = str(e).lower()
-            # If 404 (not found) or 429 (rate limit / tokens exceeded), rotate to next vision model
             if any(k in err_msg for k in ["model_not_found", "does not exist", "404", "rate_limit", "429", "tokens per day"]):
                 continue
             else:
@@ -427,7 +436,7 @@ Strict Grounding Rules:
      * CRITICAL: Whenever introducing a scientific or academic concept in Kannada, ALWAYS write the original English textbook term in brackets immediately next to it.
        Examples: ದ್ಯುತಿಸಂಶ್ಲೇಷಣೆ (Photosynthesis), ಹೂವಿನ ಎಸಳುಗಳು (Petals), ಕೇಸರ (Stamen), ಅಂಡಾಶಯ (Ovary), ಪರಾಗಸ್ಪರ್ಶ (Pollination).
    - If Target Language is "English":
-     * Explain in plain, friendly, conversational English suitable for a parent.
+     * Explain in plain, friendly, conversational English suitable for a parent with Indian English idioms and clear phrasing.
 4. Citing Sources:
    * Conclude your answer by citing the exact page numbers from which the information was gathered (e.g., "📖 ಆಧಾರ: ಪುಟ 2, 3" or "📖 Source: Page 2, 3").
 """
@@ -522,7 +531,7 @@ def transcribe_kannada_audio(audio_bytes: bytes, target_language: str = "Kannada
 
 
 # ---------------------------------------------------------
-# Stage 5: Kannada Text-to-Speech (Edge-TTS kn-IN-SapnaNeural)
+# Stage 5: Neural Indian English & Kannada TTS (Edge-TTS)
 # ---------------------------------------------------------
 async def _generate_edge_tts_audio(text: str, voice: str) -> bytes:
     """Asynchronous worker to stream audio bytes from Microsoft Edge TTS."""
@@ -534,16 +543,14 @@ async def _generate_edge_tts_audio(text: str, voice: str) -> bytes:
     return audio_stream
 
 
-def speak_kannada_text(text: str, target_language: str = "Kannada (ಕನ್ನಡ)") -> bytes:
+def speak_kannada_text(text: str, voice_name: str = "kn-IN-SapnaNeural") -> bytes:
     """
-    Synthesizes natural Kannada speech using Microsoft Neural Voice (kn-IN-SapnaNeural)
+    Synthesizes speech using Microsoft Neural Voice (Indian English or Kannada)
     at ₹0 API cost with zero external registration required.
-    Truncates to the first 500 characters for snappy, instantaneous audio delivery.
     """
-    voice = "kn-IN-SapnaNeural" if "Kannada" in target_language else "en-IN-NeerjaNeural"
-    
-    cleaned = text[:500]
-    for ch in ["*", "#", "_", "`", ">", "[", "]", "(", ")"]:
+    # Replace parentheses with a brief pause comma for natural bilingual audio flow
+    cleaned = text[:500].replace("(", ", ").replace(")", ", ")
+    for ch in ["*", "#", "_", "`", ">", "[", "]", "\n"]:
         cleaned = cleaned.replace(ch, " ")
     cleaned = " ".join(cleaned.split())
 
@@ -552,10 +559,10 @@ def speak_kannada_text(text: str, target_language: str = "Kannada (ಕನ್ನ�
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 new_loop = asyncio.new_event_loop()
-                return new_loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice))
-            return loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice))
+                return new_loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice_name))
+            return loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice_name))
         except RuntimeError:
-            return asyncio.run(_generate_edge_tts_audio(cleaned, voice))
+            return asyncio.run(_generate_edge_tts_audio(cleaned, voice_name))
     except Exception as e:
         st.warning(f"Could not synthesize audio: {e}")
         return b""
@@ -636,10 +643,20 @@ with st.sidebar:
         help="Choose the language in which you want answers explained.",
     )
     
+    # Authentic Indian English and Kannada voice selector
+    default_voice_idx = 0 if target_language == "English" else 2
+    voice_option = st.selectbox(
+        label="🎙️ Voice Accent / Speaker (ಧ್ವನಿ)",
+        options=list(VOICE_MAP.keys()),
+        index=default_voice_idx,
+        help="Choose Indian English or Kannada neural speakers.",
+    )
+    selected_voice_code = VOICE_MAP[voice_option]
+
     read_aloud = st.checkbox(
         label="🔊 Read answer aloud (ಧ್ವನಿ ಮೂಲಕ ಓದಿ)",
         value=False,
-        help="Automatically plays spoken Kannada audio narration using Microsoft's free neural voice (kn-IN-SapnaNeural).",
+        help="Automatically plays spoken audio narration using the chosen neural voice.",
     )
 
     st.divider()
@@ -690,7 +707,7 @@ with st.sidebar:
 
     st.caption("🧠 Embedding: `paraphrase-multilingual-MiniLM-L12-v2`")
     st.caption("🎤 STT: `whisper-large-v3-turbo` (Groq Free)")
-    st.caption("🔊 TTS: `kn-IN-SapnaNeural` (Edge-TTS ₹0)")
+    st.caption(f"🔊 TTS: `{selected_voice_code}` (Edge-TTS ₹0)")
     st.caption("🎥 Video: `YouTube Agent` (Kannada CC, ₹0)")
 
 
@@ -821,8 +838,8 @@ if active_question:
                     play_clicked = st.button("🔊 Listen (ಕೇಳಿ)", use_container_width=True)
 
                 if read_aloud or play_clicked:
-                    with st.spinner("🔊 Generating spoken Kannada audio..."):
-                        audio_speech = speak_kannada_text(answer, target_language)
+                    with st.spinner(f"🔊 Speaking with {voice_option}..."):
+                        audio_speech = speak_kannada_text(answer, selected_voice_code)
                         if audio_speech:
                             st.audio(audio_speech, format="audio/mp3", autoplay=True)
                 
