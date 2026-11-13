@@ -1,0 +1,12 @@
+streamlit
+python-dotenv
+pymupdf
+groq
+edge-tts
+sentence-transformers
+langchain
+langchain-community
+langchain-huggingface
+langchain-chroma
+langchain-groq
+

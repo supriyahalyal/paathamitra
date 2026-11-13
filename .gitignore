@@ -1,0 +1,14 @@
+# Environment variables and secrets
+.env
+
+# Virtual environment
+venv/
+.venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Local Chroma vector database directory
+textbook_db/
+
