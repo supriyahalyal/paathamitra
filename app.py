@@ -1,29 +1,30 @@
 """
-Paathamitra (ಪಾಠಮಿತ್ರ) - Stage 4: LangChain RAG Pipeline (Grounded Kannada Explanations)
-========================================================================================
-In this stage, we implement:
-1. Retrieval: Fetches top k=3 relevant English textbook chunks from ChromaDB for any query.
-2. LCEL (LangChain Expression Language) Chain: prompt | llm | StrOutputParser()
-   using ChatGroq with dynamic model detection and fallback (e.g. llama-3.3-70b, llama-3.1-8b, qwen3-32b).
-3. Grounded Prompts: Strictly answers only from textbook context, explains in simple everyday
-   spoken Kannada, preserves key English scientific terms in brackets, and cites page numbers.
-4. Source Attribution: Displays an expandable section showing the exact English textbook text used.
-5. Persistent Memory: ChromaDB stays saved in ./textbook_db across browser refreshes.
+Paathamitra (ಪಾಠಮಿತ್ರ) - Stage 5: Free Kannada Voice Input & Output (Groq Whisper + Edge-TTS)
+=============================================================================================
+In this final stage, we complete the end-to-end ₹0 Multilingual Parent Study Helper:
+1. Speech-to-Text (STT): Groq Whisper API (whisper-large-v3-turbo with language="kn")
+   converts spoken Kannada/Kanglish into accurate text via st.audio_input.
+2. Text-to-Speech (TTS): Microsoft neural voice (kn-IN-SapnaNeural) via edge-tts
+   (100% free, no API key required) to read explanations aloud for parents.
+3. Audio Controls: Sidebar toggle ("Read answer aloud") and on-demand audio playback button.
+4. Full RAG integration: Upload -> OCR -> Vector DB -> Retrieval -> Reasoning -> Spoken Audio.
 """
 
 import os
 import sys
 import shutil
 import base64
+import asyncio
 import streamlit as st
 import fitz  # PyMuPDF: fast and lightweight PDF parsing library
-from groq import Groq  # Groq SDK for ultra-fast LPU inference
+from groq import Groq  # Groq SDK for ultra-fast LPU inference (Vision, LLM, Whisper)
 from langchain_core.documents import Document  # Container for page & chunk text with metadata
 from langchain_core.embeddings import Embeddings  # Base interface for vector embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter  # Smart text chunking
 from langchain_core.prompts import ChatPromptTemplate  # Prompt templating
 from langchain_core.output_parsers import StrOutputParser  # Clean string parser for LCEL
 from langchain_groq import ChatGroq  # Groq LLM integration
+import edge_tts  # Microsoft Neural TTS (100% free, ₹0 API key)
 from dotenv import load_dotenv
 
 # Try importing Chroma with safe fallbacks
@@ -149,6 +150,7 @@ def clear_vector_store():
     st.session_state["extracted_docs"] = None
     st.session_state["chunks_count"] = 0
     st.session_state["current_file_name"] = None
+    st.session_state["last_transcription"] = None
 
 
 # ---------------------------------------------------------
@@ -339,7 +341,6 @@ def get_groq_reasoning_models(groq_api_key: str) -> list[str]:
             if p in available_ids and p not in candidates:
                 candidates.append(p)
         for m_id in available_ids:
-            # Filter out non-chat / specialized models
             if not any(k in m_id.lower() for k in ["whisper", "guard", "vision", "preview"]) and m_id not in candidates:
                 candidates.append(m_id)
     except Exception:
@@ -419,7 +420,6 @@ def ask_textbook(question: str, target_language: str) -> tuple[str, list[Documen
                 temperature=0.3,
                 groq_api_key=groq_api_key,
             )
-            # LCEL Chain: Prompt -> LLM -> String Output Parser
             chain = prompt | llm | StrOutputParser()
             answer = chain.invoke({
                 "context": context_text,
@@ -430,7 +430,6 @@ def ask_textbook(question: str, target_language: str) -> tuple[str, list[Documen
         except Exception as e:
             last_error = e
             err_str = str(e).lower()
-            # If 404 model not found, try the next candidate model
             if "model_not_found" in err_str or "does not exist" in err_str or "404" in err_str:
                 continue
             else:
@@ -439,6 +438,77 @@ def ask_textbook(question: str, target_language: str) -> tuple[str, list[Documen
     raise RuntimeError(
         f"Unable to generate explanation. Tried models {candidate_models}. Last error: {last_error}"
     )
+
+
+# ---------------------------------------------------------
+# Stage 5: Kannada Speech-to-Text (Groq Whisper API)
+# ---------------------------------------------------------
+def transcribe_kannada_audio(audio_bytes: bytes, target_language: str = "Kannada (ಕನ್ನಡ)") -> str:
+    """
+    Transcribes spoken Kannada, Kanglish, or English audio into text
+    using Groq Whisper API (whisper-large-v3-turbo, language="kn" or "en").
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key or groq_api_key == "your_groq_api_key_here":
+        raise ValueError("GROQ_API_KEY is not set. Please configure your key in the .env file.")
+
+    client = Groq(api_key=groq_api_key)
+    lang_code = "kn" if "Kannada" in target_language else "en"
+
+    # Send audio bytes directly in tuple format (filename, bytes) to Groq Whisper
+    transcription = client.audio.transcriptions.create(
+        file=("user_audio.wav", audio_bytes),
+        model="whisper-large-v3-turbo",
+        language=lang_code,
+        response_format="text",
+    )
+    
+    return transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
+
+
+# ---------------------------------------------------------
+# Stage 5: Kannada Text-to-Speech (Edge-TTS kn-IN-SapnaNeural)
+# ---------------------------------------------------------
+async def _generate_edge_tts_audio(text: str, voice: str) -> bytes:
+    """Asynchronous worker to stream audio bytes from Microsoft Edge TTS."""
+    communicate = edge_tts.Communicate(text, voice)
+    audio_stream = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_stream += chunk["data"]
+    return audio_stream
+
+
+def speak_kannada_text(text: str, target_language: str = "Kannada (ಕನ್ನಡ)") -> bytes:
+    """
+    Synthesizes natural Kannada speech using Microsoft Neural Voice (kn-IN-SapnaNeural)
+    at ₹0 API cost with zero external registration required.
+    Truncates to the first 500 characters for snappy, instantaneous audio delivery.
+    """
+    # Select voice based on language setting
+    voice = "kn-IN-SapnaNeural" if "Kannada" in target_language else "en-IN-NeerjaNeural"
+    
+    # Take first 500 characters to keep audio response snappy
+    cleaned = text[:500]
+    # Remove markdown formatting characters for clean spoken pronunciation
+    for ch in ["*", "#", "_", "`", ">", "[", "]", "(", ")"]:
+        cleaned = cleaned.replace(ch, " ")
+    cleaned = " ".join(cleaned.split())
+
+    try:
+        # Run async coroutine safely across environments
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If running inside an existing loop, run via new event loop
+                new_loop = asyncio.new_event_loop()
+                return new_loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice))
+            return loop.run_until_complete(_generate_edge_tts_audio(cleaned, voice))
+        except RuntimeError:
+            return asyncio.run(_generate_edge_tts_audio(cleaned, voice))
+    except Exception as e:
+        st.warning(f"Could not synthesize audio: {e}")
+        return b""
 
 
 # ---------------------------------------------------------
@@ -454,6 +524,13 @@ with st.sidebar:
         help="Choose the language in which you want answers explained.",
     )
     
+    # Audio Read Aloud Toggle
+    read_aloud = st.checkbox(
+        label="🔊 Read answer aloud (ಧ್ವನಿ ಮೂಲಕ ಓದಿ)",
+        value=False,
+        help="Automatically plays spoken Kannada audio narration using Microsoft's free neural voice (kn-IN-SapnaNeural).",
+    )
+
     st.divider()
 
     # Memory Status Indicator
@@ -490,6 +567,8 @@ with st.sidebar:
         st.warning("⚠️ Groq API Key: Not detected in .env")
 
     st.caption("🧠 Embedding: `paraphrase-multilingual-MiniLM-L12-v2`")
+    st.caption("🎤 STT: `whisper-large-v3-turbo` (Groq Free)")
+    st.caption("🔊 TTS: `kn-IN-SapnaNeural` (Edge-TTS ₹0)")
 
 
 # ---------------------------------------------------------
@@ -552,29 +631,63 @@ if uploaded_file is not None:
 st.divider()
 
 # ---------------------------------------------------------
-# Section 2: Grounded RAG Question Answering
+# Section 2: Grounded RAG Question Answering (Voice & Text)
 # ---------------------------------------------------------
 st.subheader("2. Ask a Question (ಪ್ರಶ್ನೆ ಕೇಳಿ)")
 
-user_question = st.text_input(
-    label="Enter your question in Kannada, Kanglish, or English:",
+# Voice Microphone Input via Streamlit 1.40+
+audio_input_data = st.audio_input("🎤 Tap to speak in Kannada or English (ಧ್ವನಿ ಮೂಲಕ ಪ್ರಶ್ನೆ ಕೇಳಿ)")
+
+voice_transcription = ""
+if audio_input_data is not None:
+    audio_bytes = audio_input_data.getvalue()
+    # Check if this is a newly recorded audio clip
+    if st.session_state.get("last_recorded_audio") != audio_bytes:
+        st.session_state["last_recorded_audio"] = audio_bytes
+        with st.spinner("🎙️ Transcribing Kannada speech using Groq Whisper..."):
+            try:
+                voice_transcription = transcribe_kannada_audio(audio_bytes, target_language)
+                st.session_state["active_transcription"] = voice_transcription
+                st.success(f"🗣️ Heard: **{voice_transcription}**")
+            except Exception as e:
+                st.error(f"❌ Voice transcription error: {e}")
+
+# Text input fallback / manual typing
+user_typed_question = st.text_input(
+    label="Or type your question in Kannada, Kanglish, or English:",
+    value=st.session_state.get("active_transcription", ""),
     placeholder="e.g., ಹೂವಿನ ಭಾಗಗಳು ಯಾವುವು? or What are the parts of a flower?",
 )
 
-if user_question:
+active_question = user_typed_question.strip()
+
+if active_question:
     st.markdown("### 💬 Your Question (ನಿಮ್ಮ ಪ್ರಶ್ನೆ):")
-    st.write(f"**Question:** {user_question}")
+    st.write(f"**Question:** {active_question}")
     st.write(f"**Selected Explanation Language:** {target_language}")
     
     vs = get_vector_store()
     if vs is not None:
         with st.spinner("🤖 Consulting Paathamitra & reading textbook excerpts..."):
             try:
-                answer, source_docs = ask_textbook(user_question, target_language)
+                answer, source_docs = ask_textbook(active_question, target_language)
                 
                 # Display Answer in a clean presentation card
                 st.markdown("### 💡 Explanation (ವಿವರಣೆ):")
                 st.markdown(answer)
+                
+                # Audio Playback Handling
+                # 1. Automatic if sidebar checkbox is ticked
+                # 2. Or manual button click
+                col1, col2 = st.columns([1, 4])
+                with col1:
+                    play_clicked = st.button("🔊 Play Voice (ಕೇಳಿ)")
+
+                if read_aloud or play_clicked:
+                    with st.spinner("🔊 Generating spoken Kannada audio..."):
+                        audio_speech = speak_kannada_text(answer, target_language)
+                        if audio_speech:
+                            st.audio(audio_speech, format="audio/mp3", autoplay=True)
                 
                 # Display Source Chunks Expander for full parent transparency
                 with st.expander("📖 View Extracted English Textbook Text (ಮೂಲ ಪಠ್ಯಪುಸ್ತಕ ಪುಟಗಳು)", expanded=False):
